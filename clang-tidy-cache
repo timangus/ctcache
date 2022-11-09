@@ -235,7 +235,11 @@ class ClangTidyServerCache(object):
             pass
         return False
 
-    def store_in_cache(self, digest):
+    def cached_output(self, digest):
+        #FIXME
+        return (b'', b'')
+
+    def store_in_cache(self, digest, output):
         try:
             query = requests.get(self._make_store_url(digest), timeout=3)
             if query.status_code == 200:
@@ -292,10 +296,20 @@ class ClangTidyLocalCache(object):
 
         return False
 
-    def store_in_cache(self, digest):
+    def cached_output(self, digest):
+        p = self._make_path(digest)
+        f = open(p, "r")
+        output = f.read()
+        f.close()
+        return output
+
+    def store_in_cache(self, digest, output):
         p = self._make_path(digest)
         self._mkdir_p(os.path.dirname(p))
-        open(p, "w").close()
+
+        f = open(p, "w")
+        f.write(output)
+        f.close()
 
     def _mkdir_p(self, path):
         try:
@@ -335,7 +349,11 @@ class ClangTidyS3Cache(object):
 
         return True
 
-    def store_in_cache(self, digest):
+    def cached_output(self, digest):
+        #FIXME
+        return (b'', b'')
+
+    def store_in_cache(self, digest, output):
         try:
             path = self._make_path(digest)
             self._client.put_object(Bucket=self._bucket, Key=path, Body=digest)
@@ -373,14 +391,28 @@ class ClangTidyCache(object):
 
         return False
 
-    def store_in_cache(self, digest):
-        self._local_cache.store_in_cache(digest)
+    def cached_output(self, digest):
+        if self._local_cache.is_cached(digest):
+            output = self._local_cache.cached_output(digest)
+        elif self._server_cache != None and self._server_cache.is_cached(digest):
+            output = self._server_cache.cached_output(digest)
+        elif self._s3_cache != None and self._s3_cache.is_cached(digest):
+            output = self._s3_cache.cached_output(digest)
+
+        decoded = json.loads(output)
+        return (decoded["stdout"].encode(), decoded["stderr"].encode())
+
+
+    def store_in_cache(self, digest, stdout, stderr):
+        output = json.dumps({"stdout": stdout.decode(), "stderr": stderr.decode()})
+
+        self._local_cache.store_in_cache(digest, output)
 
         if self._server_cache != None:
-            self._server_cache.store_in_cache(digest)
+            self._server_cache.store_in_cache(digest, output)
 
         if self._s3_cache != None:
-            self._s3_cache.store_in_cache(digest)
+            self._s3_cache.store_in_cache(digest, output)
 
     def query_stats(self):
         if self._server_cache is not None:
@@ -527,19 +559,30 @@ def run_clang_tidy_cached(log, opts):
     try:
         digest = hash_inputs(opts)
         if digest and cache.is_cached(digest):
+            stdout, stderr = cache.cached_output(digest)
+            sys.stdout.buffer.write(stdout)
+            sys.stderr.buffer.write(stderr)
             return 0
     except Exception as error:
         log.error(str(error))
 
-    result = subprocess.call(opts.original_args())
+    proc = subprocess.Popen(
+        opts.original_args(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
 
-    if result == 0 and digest:
+    stdout, stderr = proc.communicate()
+    sys.stdout.buffer.write(stdout)
+    sys.stderr.buffer.write(stderr)
+
+    if proc.returncode == 0 and digest:
         try:
-            cache.store_in_cache(digest)
+            cache.store_in_cache(digest, stdout, stderr)
         except Exception as error:
             log.error(str(error))
 
-    return result
+    return proc.returncode
 # ------------------------------------------------------------------------------
 
 
